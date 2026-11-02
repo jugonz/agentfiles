@@ -12,17 +12,18 @@ agentfiles/
   global/
     instructions/
       00-working-agreements.md
+      10-command-approval-hygiene.md
     skills/
-      my-skill/
+      dev-ask/
         SKILL.md
-        scripts/
-        references/
+      dev-request/
+        SKILL.md
   repos/
-    baton-claude-enterprise/
+    example-app/
       instructions/
         00-guidance.md
       skills/
-        claude-enterprise-review/
+        app-review/
           SKILL.md
   bin/
     agentfiles
@@ -35,6 +36,22 @@ The first version is convention-based. There is no manifest:
 - `repos/<name>/instructions/*.md` can be included as path-conditional guidance.
 - `repos/<name>/skills/*/SKILL.md` can be installed globally with a repo prefix,
   so the target repository does not need to be modified.
+
+## Included global skills
+
+| Skill | Purpose |
+| :--- | :--- |
+| `dev-ask` | Answer a narrow question with facts, without making changes. |
+| `dev-explain` | Investigate and explain how something works, without making changes. |
+| `dev-fyi` | Acknowledge information without starting new work. |
+| `dev-request` | Carry out a precisely scoped instruction. |
+| `continue-work` | Continue an active task and report what remains. |
+| `do-ticket` | Implement a ticket to its stated acceptance criteria. |
+| `review-loop` | Review changes and fix findings until no actionable findings remain. |
+
+Run `bin/agentfiles install --mode link` to make this repo the shared source
+for Codex and Claude. In Claude, invoke them as `/dev-ask`, `/dev-request`,
+`/dev-explain`, or `/dev-fyi` followed by the question or instruction.
 
 ## Targets
 
@@ -69,11 +86,13 @@ Install by copy:
 bin/agentfiles install --mode copy
 ```
 
-Include a repo overlay without touching that repo:
+After adding `repos/example-app/instructions/` or
+`repos/example-app/skills/` to this source tree, include that overlay without
+touching the target repo:
 
 ```bash
 bin/agentfiles install \
-  --repo-overlay baton-claude-enterprise=/Users/jugonzalez/Documents/repos/baton-claude-enterprise
+  --repo-overlay example-app=/path/to/example-app
 ```
 
 Validate the source tree:
@@ -85,19 +104,19 @@ bin/agentfiles doctor
 Add a new global skill skeleton:
 
 ```bash
-bin/agentfiles add-skill connector-review --description "Review Baton connector access models."
+bin/agentfiles add-skill code-review --description "Review code changes."
 ```
 
 Add a repo-specific skill skeleton:
 
 ```bash
-bin/agentfiles add-skill claude-enterprise-review --repo baton-claude-enterprise
+bin/agentfiles add-skill app-review --repo example-app
 ```
 
 Import an existing skill folder:
 
 ```bash
-bin/agentfiles add-skill connector-review --from /path/to/connector-review
+bin/agentfiles add-skill code-review --from /path/to/code-review
 ```
 
 Render the instruction file without installing:
