@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Convention-based installer for agent instructions and skills."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+HEADER = "<!-- managed by agentfiles; do not edit by hand -->\n"
+MANAGED_MARKER = ".agentfiles-managed"
+
+
+TARGETS = {
+    "codex": {
+        "instructions": Path(".codex/AGENTS.md"),
+        "skills": (Path(".agents/skills"), Path(".codex/skills")),
+    },
+    "claude": {
+        "instructions": Path(".claude/CLAUDE.md"),
+        "skills": (Path(".claude/skills"),),
+    },
+}
+
+
+class AgentfilesError(Exception):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class RepoOverlay:
+    name: str
+    path: Path | None
+
+
+@dataclasses.dataclass(frozen=True)
+class Skill:
+    source_dir: Path
+    install_name: str
+    metadata_name: str
+    description: str
+    scope: str
+
+
+class ActionLog:
+    def __init__(self, dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.actions: list[str] = []
+
+    def add(self, message: str) -> None:
+        self.actions.append(message)
+        print(("DRY-RUN " if self.dry_run else "") + message)
+
+
+def repo_root_from_script() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def expand_home(path: Path, home: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return home / path
+
+
+def parse_repo_overlay(spec: str) -> RepoOverlay:
+    if "=" in spec:
+        name, raw_path = spec.split("=", 1)
+    elif ":" in spec and not spec.startswith("/"):
+        name, raw_path = spec.split(":", 1)
+    else:
+        name, raw_path = spec, ""
+
+    name = name.strip()
+    if not name:
+        raise AgentfilesError(f"invalid repo overlay {spec!r}: missing name")
+    return RepoOverlay(name=name, path=Path(raw_path).expanduser() if raw_path else None)
+
+
+def slug(value: str) -> str:
+    rv = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip().lower())
+    rv = rv.strip("-")
+    if not rv:
+        raise AgentfilesError(f"could not derive slug from {value!r}")
+    return rv
+
+
+def instruction_fragments(source: Path, overlays: list[RepoOverlay]) -> list[tuple[str, Path, str]]:
+    fragments: list[tuple[str, Path, str]] = []
+    global_dir = source / "global" / "instructions"
+    for path in sorted(global_dir.glob("*.md")) if global_dir.exists() else []:
+        fragments.append(("global", path, path.read_text()))
+
+    for overlay in overlays:
+        repo_dir = source / "repos" / overlay.name / "instructions"
+        for path in sorted(repo_dir.glob("*.md")) if repo_dir.exists() else []:
+            body = path.read_text()
+            if overlay.path is not None:
+                prefix = f"## Repo Overlay: {overlay.name}\n\nWhen working under `{overlay.path}`:\n\n"
+            else:
+                prefix = f"## Repo Overlay: {overlay.name}\n\n"
+            fragments.append((overlay.name, path, prefix + body))
+
+    return fragments
+
+
+def render_instructions(source: Path, overlays: list[RepoOverlay], target: str) -> str:
+    fragments = instruction_fragments(source, overlays)
+    lines = [
+        HEADER.rstrip(),
+        "",
+        f"# {target.capitalize()} Instructions",
+        "",
+        "Generated from `agentfiles`. Edit the source fragments, then rerun `agentfiles install`.",
+        "",
+    ]
+
+    for index, (scope, path, body) in enumerate(fragments):
+        if index:
+            lines.append("")
+        rel = path.relative_to(source)
+        lines.extend([f"<!-- source: {rel} ({scope}) -->", "", body.strip(), ""])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_skill_metadata(skill_md: Path) -> tuple[str, str]:
+    text = skill_md.read_text()
+    if not text.startswith("---\n"):
+        raise AgentfilesError(f"{skill_md} must start with YAML front matter")
+
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise AgentfilesError(f"{skill_md} is missing closing YAML front matter delimiter")
+
+    fields: dict[str, str] = {}
+    for raw_line in text[4:end].splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip().strip("\"'")
+
+    name = fields.get("name", "")
+    description = fields.get("description", "")
+    if not name:
+        raise AgentfilesError(f"{skill_md} is missing required front matter field: name")
+    if not description:
+        raise AgentfilesError(f"{skill_md} is missing required front matter field: description")
+    return name, description
+
+
+def iter_skill_dirs(root: Path) -> Iterable[Path]:
+    if not root.exists():
+        return
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and (child / "SKILL.md").is_file():
+            yield child
+
+
+def discover_skills(source: Path, overlays: list[RepoOverlay]) -> list[Skill]:
+    skills: list[Skill] = []
+    for skill_dir in iter_skill_dirs(source / "global" / "skills"):
+        name, description = parse_skill_metadata(skill_dir / "SKILL.md")
+        skills.append(Skill(skill_dir, skill_dir.name, name, description, "global"))
+
+    for overlay in overlays:
+        repo_skill_root = source / "repos" / overlay.name / "skills"
+        for skill_dir in iter_skill_dirs(repo_skill_root):
+            name, description = parse_skill_metadata(skill_dir / "SKILL.md")
+            install_name = f"{slug(overlay.name)}--{skill_dir.name}"
+            skills.append(Skill(skill_dir, install_name, name, description, overlay.name))
+
+    return skills
+
+
+def validate_skill_names(skills: list[Skill]) -> None:
+    by_name: dict[str, list[Skill]] = {}
+    for skill in skills:
+        by_name.setdefault(skill.metadata_name, []).append(skill)
+
+    duplicates = {name: items for name, items in by_name.items() if len(items) > 1}
+    if not duplicates:
+        return
+
+    details = []
+    for name, items in duplicates.items():
+        locations = ", ".join(str(item.source_dir) for item in items)
+        details.append(f"{name}: {locations}")
+    raise AgentfilesError("duplicate skill metadata names found:\n" + "\n".join(details))
+
+
+def ensure_parent(path: Path, log: ActionLog) -> None:
+    if path.parent.exists():
+        return
+    log.add(f"mkdir -p {path.parent}")
+    if not log.dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def write_managed_file(path: Path, content: str, *, force: bool, log: ActionLog) -> None:
+    ensure_parent(path, log)
+    if path.exists():
+        existing = path.read_text()
+        if existing == content:
+            log.add(f"unchanged {path}")
+            return
+        if not existing.startswith(HEADER) and not force:
+            raise AgentfilesError(f"{path} exists and is not managed by agentfiles; pass --force to overwrite")
+        log.add(f"update {path}")
+    else:
+        log.add(f"create {path}")
+    if not log.dry_run:
+        path.write_text(content)
+
+
+def is_managed_skill_copy(path: Path) -> bool:
+    return path.is_dir() and (path / MANAGED_MARKER).is_file()
+
+
+def safe_remove_skill(path: Path, *, force: bool, log: ActionLog) -> None:
+    if path.is_symlink():
+        log.add(f"remove symlink {path}")
+        if not log.dry_run:
+            path.unlink()
+        return
+    if is_managed_skill_copy(path):
+        log.add(f"remove managed skill copy {path}")
+        if not log.dry_run:
+            shutil.rmtree(path)
+        return
+    if force:
+        log.add(f"remove unmanaged skill target {path}")
+        if not log.dry_run:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        return
+    raise AgentfilesError(f"{path} exists and is not managed by agentfiles; pass --force to replace it")
+
+
+def link_skill(skill: Skill, dest: Path, *, force: bool, log: ActionLog) -> None:
+    source = skill.source_dir.resolve()
+    if dest.exists() or dest.is_symlink():
+        if dest.is_symlink() and Path(os.readlink(dest)) == source:
+            log.add(f"unchanged {dest}")
+            return
+        safe_remove_skill(dest, force=force, log=log)
+
+    log.add(f"link {dest} -> {source}")
+    if not log.dry_run:
+        dest.symlink_to(source, target_is_directory=True)
+
+
+def copy_skill(skill: Skill, dest: Path, *, force: bool, log: ActionLog) -> None:
+    if dest.exists() or dest.is_symlink():
+        if dest.is_dir() and not dest.is_symlink():
+            marker = dest / MANAGED_MARKER
+            source_marker = marker.read_text().strip() if marker.exists() else ""
+            if source_marker == str(skill.source_dir.resolve()):
+                safe_remove_skill(dest, force=force, log=log)
+            else:
+                safe_remove_skill(dest, force=force, log=log)
+        else:
+            safe_remove_skill(dest, force=force, log=log)
+
+    log.add(f"copy {skill.source_dir} -> {dest}")
+    if not log.dry_run:
+        shutil.copytree(skill.source_dir, dest)
+        (dest / MANAGED_MARKER).write_text(str(skill.source_dir.resolve()) + "\n")
+
+
+def install_skills(
+    skills: list[Skill],
+    dest_root: Path,
+    *,
+    mode: str,
+    force: bool,
+    clean: bool,
+    log: ActionLog,
+) -> None:
+    if not dest_root.exists():
+        log.add(f"mkdir -p {dest_root}")
+        if not log.dry_run:
+            dest_root.mkdir(parents=True, exist_ok=True)
+
+    expected = {skill.install_name for skill in skills}
+
+    if clean and dest_root.exists():
+        for child in sorted(dest_root.iterdir()):
+            if child.name in expected:
+                continue
+            if child.is_symlink() or is_managed_skill_copy(child):
+                safe_remove_skill(child, force=False, log=log)
+
+    for skill in skills:
+        dest = dest_root / skill.install_name
+        if mode == "link":
+            link_skill(skill, dest, force=force, log=log)
+        else:
+            copy_skill(skill, dest, force=force, log=log)
+
+
+def preflight_managed_file(path: Path, *, force: bool) -> None:
+    if (path.exists() or path.is_symlink()) and not path.is_file():
+        raise AgentfilesError(f"{path} exists and is not a regular file")
+    if path.exists() and not path.read_text().startswith(HEADER) and not force:
+        raise AgentfilesError(f"{path} exists and is not managed by agentfiles; pass --force to overwrite")
+
+
+def preflight_skill_install(skills: list[Skill], dest_root: Path, *, mode: str, force: bool) -> None:
+    if (dest_root.exists() or dest_root.is_symlink()) and not dest_root.is_dir():
+        raise AgentfilesError(f"{dest_root} exists and is not a directory")
+
+    for skill in skills:
+        dest = dest_root / skill.install_name
+        if not (dest.exists() or dest.is_symlink()):
+            continue
+        if mode == "link" and dest.is_symlink() and Path(os.readlink(dest)) == skill.source_dir.resolve():
+            continue
+        if dest.is_symlink() or is_managed_skill_copy(dest) or force:
+            continue
+        raise AgentfilesError(f"{dest} exists and is not managed by agentfiles; pass --force to replace it")
+
+
+def selected_targets(value: str) -> list[str]:
+    if value == "all":
+        return list(TARGETS)
+    return [value]
+
+
+def command_install(args: argparse.Namespace) -> int:
+    source = args.source.resolve()
+    overlays = [parse_repo_overlay(spec) for spec in args.repo_overlay]
+    skills = discover_skills(source, overlays)
+    validate_skill_names(skills)
+
+    home = args.home.expanduser().resolve()
+    log = ActionLog(args.dry_run)
+
+    for target in selected_targets(args.target):
+        target_info = TARGETS[target]
+        instruction_path = expand_home(target_info["instructions"], home)
+        preflight_managed_file(instruction_path, force=args.force)
+        for skill_path in target_info["skills"]:
+            skill_root = expand_home(skill_path, home)
+            preflight_skill_install(skills, skill_root, mode=args.mode, force=args.force)
+
+    for target in selected_targets(args.target):
+        target_info = TARGETS[target]
+        instruction_path = expand_home(target_info["instructions"], home)
+
+        content = render_instructions(source, overlays, target)
+        write_managed_file(instruction_path, content, force=args.force, log=log)
+        for skill_path in target_info["skills"]:
+            skill_root = expand_home(skill_path, home)
+            install_skills(skills, skill_root, mode=args.mode, force=args.force, clean=args.clean, log=log)
+
+    if not log.actions:
+        print("nothing to do")
+    return 0
+
+
+def command_render(args: argparse.Namespace) -> int:
+    overlays = [parse_repo_overlay(spec) for spec in args.repo_overlay]
+    sys.stdout.write(render_instructions(args.source.resolve(), overlays, args.target))
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    source = args.source.resolve()
+    overlays = [parse_repo_overlay(spec) for spec in args.repo_overlay]
+    fragments = instruction_fragments(source, overlays)
+    skills = discover_skills(source, overlays)
+    validate_skill_names(skills)
+
+    print(f"source: {source}")
+    print(f"instruction fragments: {len(fragments)}")
+    print(f"skills: {len(skills)}")
+    for skill in skills:
+        print(f"- {skill.metadata_name} ({skill.scope}) -> {skill.install_name}")
+    return 0
+
+
+def command_add_skill(args: argparse.Namespace) -> int:
+    source = args.source.resolve()
+    if args.repo:
+        dest = source / "repos" / args.repo / "skills" / args.name
+    else:
+        dest = source / "global" / "skills" / args.name
+
+    if dest.exists():
+        raise AgentfilesError(f"{dest} already exists")
+
+    if args.from_dir:
+        from_dir = args.from_dir.expanduser().resolve()
+        if not (from_dir / "SKILL.md").is_file():
+            raise AgentfilesError(f"{from_dir} does not contain SKILL.md")
+        parse_skill_metadata(from_dir / "SKILL.md")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(from_dir, dest)
+        print(f"copied {from_dir} -> {dest}")
+        return 0
+
+    description = args.description or f"TODO: describe when to use {args.name}."
+    dest.mkdir(parents=True)
+    (dest / "SKILL.md").write_text(
+        "---\n"
+        f"name: {args.name}\n"
+        f"description: {description}\n"
+        "---\n\n"
+        "TODO: describe the workflow, inputs, constraints, and expected output.\n"
+    )
+    (dest / "references").mkdir()
+    (dest / "scripts").mkdir()
+    print(f"created {dest}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, default=repo_root_from_script(), help="agentfiles source repo")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install = subparsers.add_parser("install", help="install instructions and skills")
+    install.add_argument("--target", choices=["all", *TARGETS.keys()], default="all")
+    install.add_argument("--home", type=Path, default=Path.home(), help="home directory for target paths")
+    install.add_argument("--mode", choices=["link", "copy"], default="link", help="how to install skill directories")
+    install.add_argument("--repo-overlay", action="append", default=[], help="include repos/<name>; optionally name=/path")
+    install.add_argument("--force", action="store_true", help="overwrite unmanaged targets")
+    install.add_argument("--clean", action="store_true", help="remove stale managed skills from target dirs")
+    install.add_argument("--dry-run", action="store_true", help="print actions without changing files")
+    install.set_defaults(func=command_install)
+
+    render = subparsers.add_parser("render", help="render instructions to stdout")
+    render.add_argument("--target", choices=list(TARGETS), default="codex")
+    render.add_argument("--repo-overlay", action="append", default=[], help="include repos/<name>; optionally name=/path")
+    render.set_defaults(func=command_render)
+
+    doctor = subparsers.add_parser("doctor", help="validate the source tree")
+    doctor.add_argument("--repo-overlay", action="append", default=[], help="include repos/<name>; optionally name=/path")
+    doctor.set_defaults(func=command_doctor)
+
+    add_skill = subparsers.add_parser("add-skill", help="create or import a skill")
+    add_skill.add_argument("name", help="skill folder name")
+    add_skill.add_argument("--repo", help="create under repos/<repo>/skills instead of global/skills")
+    add_skill.add_argument("--description", help="description for a new skill skeleton")
+    add_skill.add_argument("--from", dest="from_dir", type=Path, help="copy an existing skill folder")
+    add_skill.set_defaults(func=command_add_skill)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except AgentfilesError as err:
+        print(f"agentfiles: {err}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
